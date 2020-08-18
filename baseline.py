@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 import tensorflow as tf
 from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import f1_score
 tf.keras.backend.set_floatx('float64')
 gpus= tf.config.experimental.list_physical_devices('GPU')
 if len(gpus) != 0:
@@ -42,7 +43,7 @@ class Stream:
         self.loss_fn = tf.keras.losses.SparseCategoricalCrossentropy()
         self.optimizer = tf.keras.optimizers.Adam(learning_rate=lr)
         self.train_score = tf.keras.metrics.Mean()
-        self.test_score = tf.keras.metrics.SparseCategoricalAccuracy()
+        self.test_score = tf.keras.metrics.Mean()
     
     def read_data(self):
         train_df = pd.read_csv('train.csv')
@@ -91,7 +92,8 @@ class Stream:
                 for sample in range(self.sample_num - 1):
                     preds += model(inputs)
                 preds /= self.sample_num
-            self.test_score(labels, preds)
+            acc = f1_score(labels.numpy(), np.argmax(preds.numpy(), axis=1), average='macro')
+            self.test_score(acc)
     
     def cv(self, x, y, vocab_size):
         kf = StratifiedKFold(n_splits=self.cv_num)
