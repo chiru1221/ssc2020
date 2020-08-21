@@ -1,26 +1,32 @@
 import numpy as np
 import pandas as pd
 import tensorflow as tf
+import tensorflow_probability as tfp
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import f1_score
 import re
-import nltk
-nltk.download('stopwords')
 from nltk.corpus import stopwords
 from nltk.stem.porter import PorterStemmer
 import gensim
+import os
+import random
 tf.keras.backend.set_floatx('float64')
 gpus= tf.config.experimental.list_physical_devices('GPU')
 if len(gpus) != 0:
     tf.config.experimental.set_memory_growth(gpus[0], True)
+os.environ['PYTHONHASHSEED'] = '0'
+# np.random.seed(0)
+# random.seed(0)
+# tf.random.set_seed(0)
 
-class Baseline(tf.keras.Model):
-    def __init__(self, vocab_size, embed_dim, sample_num):
+class BNN(tf.keras.Model):
+    def __init__(self, vocab_size, embed_dim, sample_num, seed=0):
         super().__init__()
+        self.seed = seed
         self.embed = tf.keras.layers.Embedding(vocab_size, embed_dim)
-        self.fc1 = tf.keras.layers.Dense(400)
-        self.fc2 = tf.keras.layers.Dense(400)
-        self.fc3 = tf.keras.layers.Dense(4)
+        self.fc1 = tfp.layers.DenseFlipout(400, kernel_posterior_tensor_fn=lambda d: d.sample(sample_num, seed=self.seed), bias_posterior_tensor_fn=lambda d:d.sample(seed=self.seed))
+        self.fc2 = tfp.layers.DenseFlipout(400, kernel_posterior_tensor_fn=lambda d: d.sample(sample_num, seed=self.seed), bias_posterior_tensor_fn=lambda d:d.sample(seed=self.seed))
+        self.fc3 = tfp.layers.DenseFlipout(4, kernel_posterior_tensor_fn=lambda d: d.sample(sample_num, seed=self.seed), bias_posterior_tensor_fn=lambda d:d.sample(seed=self.seed))
         self.bn1 = tf.keras.layers.BatchNormalization()
         self.bn2 = tf.keras.layers.BatchNormalization()
         self.relu = tf.keras.layers.Activation('relu')
@@ -33,10 +39,11 @@ class Baseline(tf.keras.Model):
         x = self.relu(self.bn1(self.fc1(x)))
         x = self.relu(self.bn2(self.fc2(x)))
         x = self.softmax(self.fc3(x))
+        x = tf.reduce_mean(x, axis=0)
         return x
 
 class Stream:
-    def __init__(self, model, embed_dim, epoch, batch, name, lr=0.001, cv_num=5, sample_num=0, is_us=True, is_train=True, seed=0):
+    def __init__(self, model, embed_dim, epoch, batch, name, lr=0.001, cv_num=5, sample_num=0, is_us=True, is_train=True, seed=0, early_stop=None):
         self.model = model
         self.embed_dim = embed_dim
         self.epoch = epoch
@@ -47,6 +54,7 @@ class Stream:
         self.is_us = is_us
         self.is_train = is_train
         self.seed = seed
+        self.early_stop = early_stop
         
         self.loss_fn = tf.keras.losses.SparseCategoricalCrossentropy()
         self.optimizer = tf.keras.optimizers.Adam(learning_rate=lr)
@@ -61,7 +69,6 @@ class Stream:
     
     def preprocess(self, train_df, test_df):
         stemmer = PorterStemmer()
-        # model = gensim.models.KeyedVectors.load_word2vec_format('model/GoogleNews-vectors-negative300.bin', binary=True)
         
         def apply_preprocess(x):
             x = re.sub('[^a-zA-Z]', ' ', x)
@@ -69,7 +76,6 @@ class Stream:
             x = [word for word in x if len(word) >= 3]
             x = [word for word in x if word not in stopwords.words('english')]
             x = [stemmer.stem(word) for word in x]
-            # x = [word for word in x if word in model]
             return x
         
         words_train = train_df['description'].apply(apply_preprocess)
@@ -92,15 +98,18 @@ class Stream:
         return train, test, vocab_size
     
     def train(self, model, x, y):
-        train_ds = tf.data.Dataset.from_tensor_slices((x, y)).batch(self.batch).shuffle(100)
+        tf.random.set_seed(self.seed)
+        train_ds = tf.data.Dataset.from_tensor_slices((x, y)).batch(self.batch).shuffle(100, seed=self.seed)
         for inputs, labels in train_ds:
             with tf.GradientTape() as tape:
                 preds = model(inputs)
                 
-                loss = self.loss_fn(labels, preds)
+                neg_log_likelyhood = self.loss_fn(labels, preds)
+                kl_loss = sum(model.losses) / len(inputs)
+                loss = neg_log_likelyhood + kl_loss
             gradients = tape.gradient(loss, model.trainable_variables)
             self.optimizer.apply_gradients(zip(gradients, model.trainable_variables))
-            self.train_score(loss)
+            self.train_score(neg_log_likelyhood)
 
     def test(self, model, x, y):
         test_ds = tf.data.Dataset.from_tensor_slices((x, y)).batch(self.batch)
@@ -125,7 +134,7 @@ class Stream:
     def cv(self, x, y, vocab_size):
         kf = StratifiedKFold(n_splits=self.cv_num)
         def map_cv(cv_idx, idx):
-            model = self.model(vocab_size, self.embed_dim, self.sample_num)
+            model = self.model(vocab_size, self.embed_dim, self.sample_num, self.seed)
             train_idx, test_idx = idx
             x_train, x_test = x[train_idx], x[test_idx]
             y_train, y_test = y[train_idx], y[test_idx]
@@ -134,13 +143,19 @@ class Stream:
                 x_train, y_train = self.under_sample(x_train, y_train)
             
             print('cv:{0:2d}'.format(cv_idx))
+            loss = list()
             for epoch in range(self.epoch):
                 self.train_score.reset_states()
                 self.test_score.reset_states()
                 self.train(model, x_train, y_train)
                 self.test(model, x_test, y_test)
                 print('epoch:{0:3d},train:{1:.4f},test:{2:.4f}'.format(epoch, self.train_score.result().numpy(), self.test_score.result().numpy()))
-
+                loss.append(self.test_score.result().numpy())
+                if self.early_stop is not None:
+                    if self.early_stop[cv_idx] == epoch:
+                        print('train early stop in {0} epoch'.format(epoch))
+                        break
+            print(np.max(loss), np.argmax(loss))
             model.save_weights('model/' + self.name + '_{0}'.format(cv_idx))
             return self.test_score.result().numpy()
         
@@ -150,7 +165,7 @@ class Stream:
     def predict(self, x, sub_df, vocab_size):
         preds = np.zeros((len(sub_df), 4))
         for cv_idx in range(self.cv_num):
-            model = self.model(vocab_size, self.embed_dim, self.sample_num)
+            model = self.model(vocab_size, self.embed_dim, self.sample_num, self.seed)
             model.load_weights('model/' + self.name + '_{0}'.format(cv_idx))
             preds += model(x).numpy()
         sub_df.iloc[:, 1] = np.argmax(preds, axis=1) + 1
@@ -168,5 +183,13 @@ class Stream:
 
         
 if __name__ == '__main__':
-    stream = Stream(Baseline, 28, 50, 128, 'baseline')
+    stream = Stream(BNN, 50, 100, 128, 'bnn', lr=0.0005, sample_num=10, seed=5, early_stop=[25, 14, 17, 14, 20])
     stream.run()
+    # 0.0005 : 0.4250, 100, 0
+    # 1 : 0.4385, [25, 50, 60, 11, 12]
+    # 2 : 0.4396
+    # 3 : low
+    # 4 : 0.4385, (if epoch =50 is a little better)
+    # 5 : 0.4440, [25, 14, 18, 14, 33]
+
+    
