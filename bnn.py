@@ -24,9 +24,18 @@ class BNN(tf.keras.Model):
         super().__init__()
         self.seed = seed
         self.embed = tf.keras.layers.Embedding(vocab_size, embed_dim)
-        self.fc1 = tfp.layers.DenseFlipout(400, kernel_posterior_tensor_fn=lambda d: d.sample(sample_num, seed=self.seed), bias_posterior_tensor_fn=lambda d:d.sample(seed=self.seed))
-        self.fc2 = tfp.layers.DenseFlipout(400, kernel_posterior_tensor_fn=lambda d: d.sample(sample_num, seed=self.seed), bias_posterior_tensor_fn=lambda d:d.sample(seed=self.seed))
-        self.fc3 = tfp.layers.DenseFlipout(4, kernel_posterior_tensor_fn=lambda d: d.sample(sample_num, seed=self.seed), bias_posterior_tensor_fn=lambda d:d.sample(seed=self.seed))
+        
+        def kernel_posterior_tensor_fn(d):
+            tf.random.set_seed(self.seed)
+            return d.sample(sample_num, seed=self.seed)
+        
+        def bias_posterior_tensor_fn(d):
+            tf.random.set_seed(self.seed)
+            return d.sample(seed=self.seed)
+        
+        self.fc1 = tfp.layers.DenseFlipout(400, kernel_posterior_tensor_fn=kernel_posterior_tensor_fn, bias_posterior_tensor_fn=bias_posterior_tensor_fn)
+        self.fc2 = tfp.layers.DenseFlipout(400, kernel_posterior_tensor_fn=kernel_posterior_tensor_fn, bias_posterior_tensor_fn=bias_posterior_tensor_fn)
+        self.fc3 = tfp.layers.DenseFlipout(4, kernel_posterior_tensor_fn=kernel_posterior_tensor_fn, bias_posterior_tensor_fn=bias_posterior_tensor_fn)
         self.bn1 = tf.keras.layers.BatchNormalization()
         self.bn2 = tf.keras.layers.BatchNormalization()
         self.relu = tf.keras.layers.Activation('relu')
@@ -58,7 +67,8 @@ class Stream:
         
         self.loss_fn = tf.keras.losses.SparseCategoricalCrossentropy()
         self.optimizer = tf.keras.optimizers.Adam(learning_rate=lr)
-        self.train_score = tf.keras.metrics.Mean()
+        # self.train_score = tf.keras.metrics.Mean()
+        self.train_score = tf.keras.metrics.SparseCategoricalAccuracy()
         self.test_score = tf.keras.metrics.Mean()
     
     def read_data(self):
@@ -109,7 +119,8 @@ class Stream:
                 loss = neg_log_likelyhood + kl_loss
             gradients = tape.gradient(loss, model.trainable_variables)
             self.optimizer.apply_gradients(zip(gradients, model.trainable_variables))
-            self.train_score(neg_log_likelyhood)
+            # self.train_score(neg_log_likelyhood)
+            self.train_score(labels, preds)
 
     def test(self, model, x, y):
         test_ds = tf.data.Dataset.from_tensor_slices((x, y)).batch(self.batch)
@@ -183,13 +194,13 @@ class Stream:
 
         
 if __name__ == '__main__':
-    stream = Stream(BNN, 50, 100, 128, 'bnn', lr=0.0005, sample_num=10, seed=5, early_stop=[25, 14, 17, 14, 20])
+    stream = Stream(BNN, 50, 50, 128, 'bnn', lr=0.0005, sample_num=10, seed=5, early_stop=[23, 15, 12, 15, 21])
     stream.run()
     # 0.0005 : 0.4250, 100, 0
     # 1 : 0.4385, [25, 50, 60, 11, 12]
     # 2 : 0.4396
-    # 3 : low
     # 4 : 0.4385, (if epoch =50 is a little better)
-    # 5 : 0.4440, [25, 14, 18, 14, 33]
+    # 5 : 0.4440, [23, 13, 19, 19, 17]
+    # 5 : 50- 0.4573, [23, 15, 12, 15, 21] -> 0.4733
 
     
